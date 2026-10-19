@@ -8,6 +8,10 @@ on:
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
+env:
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -22,13 +26,25 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Install Android SDK packages
+      - name: Locate and prepare SDK
         run: |
           set -e
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
-        working-directory: android
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "runner SDK missing, installing cmdline-tools"
+            mkdir -p $HOME/android-sdk/cmdline-tools
+            curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/cmdtools.zip -d $HOME/android-sdk/cmdline-tools
+            mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+            echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+            echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+            export ANDROID_HOME=$HOME/android-sdk
+          fi
+          SDK="${ANDROID_HOME}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then SM="$SDK/cmdline-tools/$(ls $SDK/cmdline-tools | tail -1)/bin/sdkmanager"; fi
+          yes | $SM --sdk_root=$SDK --licenses >/dev/null || true
+          $SM --sdk_root=$SDK "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          echo "sdk.dir=$SDK" > local.properties
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -36,8 +52,6 @@ jobs:
 
       - name: Assemble debug APK
         run: gradle :app:assembleDebug --no-daemon
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
       - uses: actions/upload-artifact@v4
         with:
