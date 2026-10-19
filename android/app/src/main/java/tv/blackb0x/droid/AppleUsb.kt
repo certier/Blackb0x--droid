@@ -38,9 +38,13 @@ object AppleUsb {
         return id.cpid == CPID_A4 && id.bdid == BDID_ATV2
     }
 
-    fun claim(connection: UsbDeviceConnection, device: UsbDevice): Boolean {
+    /** claim only — setConfiguration resets DFU and kills the next OUT transfer */
+    fun claim(connection: UsbDeviceConnection, device: UsbDevice, configure: Boolean = false): Boolean {
+        if (device.interfaceCount < 1) return false
         val claimed = connection.claimInterface(device.getInterface(0), true)
-        connection.setConfiguration(device.getConfiguration(0))
+        if (configure && device.configurationCount > 0) {
+            connection.setConfiguration(device.getConfiguration(0))
+        }
         return claimed
     }
 
