@@ -17,9 +17,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Peak stable one-tap.
- * Plug ATV in DFU → grant USB once → press Jailbreak.
- * Chain: SHAtter → send iBSS → wait. Nothing else to configure.
+ * One-tap tethered boot for AppleTV2,1:
+ * SHAtter → iBSS → iBEC → ramdisk → kernel → bootx
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var usb: UsbManager
@@ -29,6 +28,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var jailbreakBtn: Button
 
     private var ibss: ByteArray? = null
+    private var ibec: ByteArray? = null
+    private var ramdisk: ByteArray? = null
+    private var kernel: ByteArray? = null
     private var device: UsbDevice? = null
     private val running = AtomicBoolean(false)
     private val io = Executors.newSingleThreadExecutor()
@@ -96,17 +98,30 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private fun loadAsset(name: String): ByteArray? = try {
+        assets.open("payloads/$name").use { it.readBytes() }
+    } catch (_: Exception) {
+        null
+    }
+
     private fun loadPayloads() {
-        try {
-            ibss = assets.open("payloads/ibss.img3").use { it.readBytes() }
-            imagesStatus.text = "iBSS ready  ·  ${ibss!!.size} bytes"
+        ibss = loadAsset("ibss.img3")
+        ibec = loadAsset("ibec.img3")
+        ramdisk = loadAsset("ramdisk.dmg")
+        kernel = loadAsset("kernelcache.img3")
+        val parts = mutableListOf<String>()
+        if (ibss != null) parts.add("iBSS ${ibss!!.size}")
+        if (ibec != null) parts.add("iBEC ${ibec!!.size}")
+        if (ramdisk != null) parts.add("RD ${ramdisk!!.size}")
+        if (kernel != null) parts.add("K ${kernel!!.size}")
+        if (ibss != null && ibec != null && kernel != null) {
+            imagesStatus.text = parts.joinToString(" · ")
             imagesStatus.setTextColor(GREEN)
-            log("payload loaded")
-        } catch (e: Exception) {
-            ibss = null
-            imagesStatus.text = "missing iBSS payload"
+            log("payloads loaded: ${parts.joinToString(", ")}")
+        } else {
+            imagesStatus.text = "missing payloads"
             imagesStatus.setTextColor(RED)
-            log("no payloads/ibss.img3 in APK")
+            log("need ibss + ibec + kernel in assets")
         }
     }
 
@@ -135,7 +150,8 @@ class MainActivity : AppCompatActivity() {
     private fun show(dev: UsbDevice) {
         val mode = AppleUsb.mode(dev)
         val id = AppleUsb.identity(dev)
-        val ready = ibss != null && mode == "dfu" && (id == null || AppleUsb.isAtv2(id))
+        val ready = ibss != null && ibec != null && kernel != null &&
+            mode == "dfu" && (id == null || AppleUsb.isAtv2(id))
         val line = when {
             mode != "dfu" -> "$mode  ·  put device in DFU"
             id != null && !AppleUsb.isAtv2(id) -> "wrong device CPID:%04X".format(id.cpid)
@@ -153,10 +169,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun startJailbreak() {
         if (!running.compareAndSet(false, true)) return
-        val image = ibss
-        if (image == null) {
+        val a = ibss
+        val b = ibec
+        val k = kernel
+        if (a == null || b == null || k == null) {
             running.set(false)
-            log("no iBSS")
+            log("payloads incomplete")
             return
         }
         jailbreakBtn.isEnabled = false
@@ -166,7 +184,7 @@ class MainActivity : AppCompatActivity() {
         log("jailbreak started")
         io.execute {
             try {
-                runChain(image)
+                runChain(a, b, ramdisk, k)
             } catch (t: Throwable) {
                 log("error: ${t.message}")
                 setStatus("failed", RED)
@@ -180,9 +198,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun runChain(ibssImage: ByteArray) {
-        // 1) SHAtter
-        log("1/2 SHAtter")
+    private fun openMode(want: String, timeoutMs: Long): Pair<UsbDevice, android.hardware.usb.UsbDeviceConnection>? {
+        val d = waitDevice(want, timeoutMs) ?: return null
+        if (!ensurePermission(d)) return null
+        val c = usb.openDevice(d) ?: return null
+        if (!AppleUsb.claim(c, d, configure = false)) {
+            c.close()
+            return null
+        }
+        return d to c
+    }
+
+    private fun runChain(
+        ibssImage: ByteArray,
+        ibecImage: ByteArray,
+        ramdiskImage: ByteArray?,
+        kernelImage: ByteArray,
+    ) {
+        log("1/5 SHAtter")
         val pwned = Shatter.run(
             usb,
             open = {
@@ -200,56 +233,96 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // device re-enumerates after SHAtter
-        Thread.sleep(2000)
+        Thread.sleep(1500)
 
-        // 2) iBSS only — ATV2 stable path (DeviceManager::sendiBSS)
-        log("2/2 send iBSS (${ibssImage.size})")
-        val dfu = waitDevice("dfu", 30_000)
-        if (dfu == null) {
+        log("2/5 send iBSS (${ibssImage.size})")
+        val dfuPair = openMode("dfu", 30_000)
+        if (dfuPair == null) {
             setStatus("DFU lost after SHAtter", RED)
-            log("device did not reappear in DFU")
-            return
-        }
-        if (!ensurePermission(dfu)) {
-            setStatus("need USB permission", RED)
-            return
-        }
-        val conn = usb.openDevice(dfu)
-        if (conn == null) {
-            setStatus("open failed", RED)
             return
         }
         try {
-            AppleUsb.claim(conn, dfu)
-            if (!AppleUsb.dfuSend(conn, ibssImage) { log(it) }) {
+            if (!AppleUsb.dfuSend(dfuPair.second, ibssImage) { log(it) }) {
                 setStatus("iBSS send failed", RED)
                 return
             }
         } finally {
-            conn.close()
+            try { dfuPair.second.close() } catch (_: Exception) {}
         }
 
-        log("waiting for boot…")
-        Thread.sleep(3000)
-        val rec = waitDevice("recovery", 25_000)
-        if (rec != null) {
-            setStatus("recovery  ·  done", GREEN)
-            log("recovery up — tethered path complete")
-            if (ensurePermission(rec)) {
-                val c = usb.openDevice(rec)
-                if (c != null) {
-                    try {
-                        AppleUsb.claim(c, rec)
-                        log("bootx -> " + AppleUsb.recoveryCommand(c, "bootx"))
-                    } finally { c.close() }
+        Thread.sleep(2500)
+
+        log("3/5 send iBEC (${ibecImage.size})")
+        var sentIbec = false
+        val rec1 = openMode("recovery", 35_000)
+        if (rec1 != null) {
+            try {
+                sentIbec = AppleUsb.recoverySend(rec1.second, rec1.first, ibecImage) { log(it) }
+            } finally {
+                try { rec1.second.close() } catch (_: Exception) {}
+            }
+        }
+        if (!sentIbec) {
+            log("recovery miss — try DFU for iBEC")
+            val dfu2 = openMode("dfu", 15_000)
+            if (dfu2 != null) {
+                try {
+                    sentIbec = AppleUsb.dfuSend(dfu2.second, ibecImage) { log(it) }
+                } finally {
+                    try { dfu2.second.close() } catch (_: Exception) {}
                 }
             }
-        } else {
-            // iBSS may have continued without recovery USB enum — still success for SHAtter+iBSS
-            setStatus("done", GREEN)
-            log("iBSS sent — check the TV")
         }
+        if (!sentIbec) {
+            setStatus("iBEC send failed", RED)
+            log("TV may stay black — iBEC did not land")
+            return
+        }
+
+        Thread.sleep(3000)
+
+        if (ramdiskImage != null && ramdiskImage.isNotEmpty()) {
+            log("4/5 send ramdisk (${ramdiskImage.size})")
+            val rec2 = openMode("recovery", 30_000)
+            if (rec2 != null) {
+                try {
+                    if (AppleUsb.recoverySend(rec2.second, rec2.first, ramdiskImage) { log(it) }) {
+                        val reply = AppleUsb.recoveryCommand(rec2.second, "ramdisk")
+                        log("ramdisk cmd -> $reply")
+                    } else {
+                        log("ramdisk send failed — continuing without")
+                    }
+                } finally {
+                    try { rec2.second.close() } catch (_: Exception) {}
+                }
+            } else {
+                log("no recovery for ramdisk — skip")
+            }
+            Thread.sleep(2000)
+        } else {
+            log("4/5 no ramdisk asset — skip")
+        }
+
+        log("5/5 send kernel (${kernelImage.size})")
+        val rec3 = openMode("recovery", 30_000)
+        if (rec3 == null) {
+            setStatus("no recovery for kernel", RED)
+            log("iBEC may have booted alone — check TV")
+            return
+        }
+        try {
+            if (!AppleUsb.recoverySend(rec3.second, rec3.first, kernelImage) { log(it) }) {
+                setStatus("kernel send failed", RED)
+                return
+            }
+            val boot = AppleUsb.recoveryCommand(rec3.second, "bootx")
+            log("bootx -> $boot")
+        } finally {
+            try { rec3.second.close() } catch (_: Exception) {}
+        }
+
+        setStatus("booting", GREEN)
+        log("chain done — watch the TV (tethered: redo after every power-off)")
     }
 
     private fun waitDevice(mode: String, timeoutMs: Long): UsbDevice? {
@@ -259,14 +332,12 @@ class MainActivity : AppCompatActivity() {
             if (dev != null && AppleUsb.mode(dev) == mode) {
                 device = dev
                 if (usb.hasPermission(dev)) return dev
-                // request and keep waiting
                 runOnUiThread {
                     val pending = PendingIntent.getBroadcast(
                         this, 0, Intent(actionUsb), PendingIntent.FLAG_IMMUTABLE
                     )
                     usb.requestPermission(dev, pending)
                 }
-                // give user a moment to accept
                 Thread.sleep(800)
                 if (usb.hasPermission(dev)) return dev
             }
