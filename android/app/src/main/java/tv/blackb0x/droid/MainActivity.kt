@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Color
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.Uri
@@ -19,6 +20,7 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
     private lateinit var usb: UsbManager
     private lateinit var status: TextView
+    private lateinit var imagesStatus: TextView
     private lateinit var logView: TextView
     private val images = ArrayList<ByteArray>()
     private var device: UsbDevice? = null
@@ -33,6 +35,10 @@ class MainActivity : AppCompatActivity() {
                 val bytes = readUri(uri)
                 images.add(bytes)
                 log("queued ${bytes.size} bytes")
+            }
+            runOnUiThread {
+                imagesStatus.text = "override — ${images.size} image(s)"
+                imagesStatus.setTextColor(Color.parseColor("#F0C040"))
             }
         }
     }
@@ -55,6 +61,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         usb = getSystemService(USB_SERVICE) as UsbManager
         status = findViewById(R.id.status)
+        imagesStatus = findViewById(R.id.images_status)
         logView = findViewById(R.id.log)
         findViewById<Button>(R.id.pick_payload).setOnClickListener { pick.launch(arrayOf("*/*")) }
         findViewById<Button>(R.id.jailbreak).setOnClickListener { startJailbreak() }
@@ -75,7 +82,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadBundled() {
-        // order matters: iBSS first after SHAtter, then iBEC, kernel, ramdisk
+        // order: iBSS after SHAtter, then iBEC, kernel, ramdisk
         for (name in listOf(
             "payloads/ibss.img3",
             "payloads/ibec.img3",
@@ -89,18 +96,28 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {
             }
         }
-        if (images.isNotEmpty()) log("ready — ${images.size} image(s) loaded, press Jailbreak")
+        if (images.isEmpty()) {
+            imagesStatus.text = "no payloads in APK"
+            imagesStatus.setTextColor(Color.parseColor("#E23D3D"))
+        } else {
+            imagesStatus.text = "bundled ${images.size}/4  ·  11D258  ·  ready"
+            imagesStatus.setTextColor(Color.parseColor("#3DDC84"))
+            log("ready — press Jailbreak")
+        }
     }
 
     private fun scan() {
         val found = appleDevice()
         if (found == null) {
             status.text = "no device"
+            status.setTextColor(Color.parseColor("#E23D3D"))
             log("waiting for 05ac:1227 or 05ac:1281")
             return
         }
         device = found
         if (!usb.hasPermission(found)) {
+            status.text = "device found — grant USB"
+            status.setTextColor(Color.parseColor("#F0C040"))
             val pending = PendingIntent.getBroadcast(this, 0, Intent(actionUsb), PendingIntent.FLAG_IMMUTABLE)
             usb.requestPermission(found, pending)
         } else show(found)
@@ -108,9 +125,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun show(dev: UsbDevice) {
         val id = AppleUsb.identity(dev)
+        val mode = AppleUsb.mode(dev)
         val who = if (id == null) "serial hidden" else "CPID:%04X BDID:%02X".format(id.cpid, id.bdid)
-        status.text = AppleUsb.mode(dev) + "  " + who
-        log(id?.raw ?: AppleUsb.mode(dev))
+        status.text = "$mode  ·  $who"
+        status.setTextColor(
+            when (mode) {
+                "dfu" -> Color.parseColor("#3DDC84")
+                "recovery" -> Color.parseColor("#4A9EFF")
+                else -> Color.parseColor("#F0C040")
+            }
+        )
+        log(id?.raw ?: mode)
     }
 
     private fun appleDevice(): UsbDevice? = usb.deviceList.values.firstOrNull {
@@ -120,7 +145,7 @@ class MainActivity : AppCompatActivity() {
     private fun startJailbreak() {
         val dev = device ?: appleDevice()
         if (dev == null) { scan(); log("no apple device on the bus"); return }
-        if (images.isEmpty()) { log("no bundled images — wait for APK built with embed step"); return }
+        if (images.isEmpty()) { log("no bundled images"); return }
         device = dev
         if (!usb.hasPermission(dev)) { scan(); return }
         val id = AppleUsb.identity(dev)
@@ -128,11 +153,12 @@ class MainActivity : AppCompatActivity() {
             log("not AppleTV2,1. got CPID:%04X BDID:%02X".format(id.cpid, id.bdid))
             return
         }
+        log("starting one-tap chain…")
         io.execute { runChain() }
     }
 
     private fun runChain() {
-        log("running SHAtter")
+        log("1/5 SHAtter")
         val pwned = Shatter.run(
             usb,
             open = {
@@ -145,24 +171,31 @@ class MainActivity : AppCompatActivity() {
             progress = { p -> log("shatter ${p.toInt()}%") },
         )
         if (!pwned) {
-            log("SHAtter failed — aborting image chain")
+            log("SHAtter failed — abort")
             return
         }
         Thread.sleep(1000)
+        val labels = listOf("iBSS", "iBEC", "kernel", "ramdisk")
         for ((index, image) in images.withIndex()) {
-            val dev = waitFor("dfu", 30000) ?: run { log("image $index: DFU did not come back"); return }
-            if (!usb.hasPermission(dev)) { log("image $index: no permission after re-enum"); return }
+            val label = labels.getOrElse(index) { "image$index" }
+            log("${index + 2}/5 send $label (${image.size})")
+            val dev = waitFor("dfu", 30000) ?: run { log("$label: DFU did not come back"); return }
+            if (!usb.hasPermission(dev)) { log("$label: no permission"); return }
             val conn = usb.openDevice(dev) ?: run { log("openDevice failed"); return }
             try {
                 AppleUsb.claim(conn, dev)
-                log("sending image $index (${image.size})")
                 if (!AppleUsb.dfuSend(conn, image) { log(it) }) return
             } finally { conn.close() }
-            if (index != images.lastIndex) { log("waiting for re-enumeration"); Thread.sleep(1500) }
+            if (index != images.lastIndex) Thread.sleep(1500)
         }
+        log("waiting recovery…")
         val rec = waitFor("recovery", 30000)
-        if (rec != null) { device = rec; log("recovery is up"); sendRecovery("bootx") }
-        else log("chain sent. recovery did not enumerate.")
+        if (rec != null) {
+            device = rec
+            log("recovery up — bootx")
+            sendRecovery("bootx")
+            log("done")
+        } else log("chain sent. recovery did not enumerate.")
     }
 
     private fun waitFor(mode: String, timeoutMs: Long): UsbDevice? {
