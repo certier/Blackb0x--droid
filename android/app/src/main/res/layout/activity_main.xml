@@ -4,7 +4,7 @@
     android:layout_height="match_parent"
     android:background="#0C0C0C"
     android:orientation="vertical"
-    android:padding="20dp">
+    android:padding="24dp">
 
     <TextView
         android:layout_width="wrap_content"
@@ -18,7 +18,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="Apple TV 2,1  ·  A1378  ·  SHAtter  ·  11D258"
+        android:text="Apple TV 2,1  ·  SHAtter"
         android:textColor="#8A8A8A"
         android:textSize="13sp" />
 
@@ -26,75 +26,44 @@
         android:id="@+id/status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="18dp"
-        android:text="no device"
-        android:textColor="#E23D3D"
-        android:textSize="16sp" />
+        android:layout_marginTop="24dp"
+        android:text="waiting for device"
+        android:textColor="#8A8A8A"
+        android:textSize="18sp" />
 
     <TextView
         android:id="@+id/images_status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
-        android:text="loading payloads…"
+        android:text=""
         android:textColor="#8A8A8A"
         android:textSize="13sp" />
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="1. USB-C OTG to ATV micro-USB (power cable stays in the ATV)\n2. Hold Menu + Down until LED blinks fast (DFU)\n3. Grant USB permission\n4. Press Jailbreak"
-        android:textColor="#C8C8C8"
-        android:textSize="14sp" />
 
     <Button
         android:id="@+id/jailbreak"
         android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:layout_marginTop="20dp"
+        android:layout_height="64dp"
+        android:layout_marginTop="28dp"
+        android:enabled="false"
         android:text="Jailbreak"
         android:textAllCaps="false"
-        android:textSize="18sp" />
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/pick_payload"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginEnd="8dp"
-            android:layout_weight="1"
-            android:text="Override payloads"
-            android:textAllCaps="false" />
-
-        <Button
-            android:id="@+id/send_boot"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="bootx"
-            android:textAllCaps="false" />
-    </LinearLayout>
+        android:textSize="20sp" />
 
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="20dp"
         android:layout_weight="1"
         android:background="#161616"
-        android:padding="10dp">
+        android:padding="12dp">
 
         <TextView
             android:id="@+id/log"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:fontFamily="monospace"
-            android:textColor="#D0D0D0"
+            android:textColor="#B8B8B8"
             android:textSize="12sp" />
     </ScrollView>
 </LinearLayout>
