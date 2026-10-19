@@ -20,21 +20,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var usb: UsbManager
     private lateinit var status: TextView
     private lateinit var logView: TextView
-    private var payload: ByteArray? = null
+    private val images = ArrayList<ByteArray>()
     private var device: UsbDevice? = null
     private val io = Executors.newSingleThreadExecutor()
     private val actionUsb = "tv.blackb0x.droid.USB_PERMISSION"
 
-    private val pick = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri == null) return@registerForActivityResult
-        try {
-            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        } catch (_: SecurityException) {
-        }
+    private val pick = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isEmpty()) return@registerForActivityResult
         io.execute {
-            val bytes = readUri(uri)
-            payload = bytes
-            log("payload ${bytes.size} bytes")
+            images.clear()
+            for (uri in uris) {
+                val bytes = readUri(uri)
+                images.add(bytes)
+                log("queued ${bytes.size} bytes")
+            }
         }
     }
 
@@ -44,8 +43,7 @@ class MainActivity : AppCompatActivity() {
             val dev = intent.parcelable<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
             if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                 device = dev
-                status.text = AppleUsb.mode(dev) + "  " + dev.deviceName
-                log("permission granted ${AppleUsb.mode(dev)}")
+                show(dev)
             } else {
                 log("usb permission denied")
             }
@@ -58,19 +56,15 @@ class MainActivity : AppCompatActivity() {
         usb = getSystemService(USB_SERVICE) as UsbManager
         status = findViewById(R.id.status)
         logView = findViewById(R.id.log)
-        findViewById<Button>(R.id.pick_payload).setOnClickListener {
-            pick.launch(arrayOf("*/*"))
-        }
+        findViewById<Button>(R.id.pick_payload).setOnClickListener { pick.launch(arrayOf("*/*")) }
         findViewById<Button>(R.id.jailbreak).setOnClickListener { startJailbreak() }
         findViewById<Button>(R.id.send_boot).setOnClickListener {
             io.execute { runCatching { sendRecovery("bootx") }.onFailure { log(it.message ?: "boot failed") } }
         }
         val filter = IntentFilter(actionUsb)
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(receiver, filter)
-        }
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+        else registerReceiver(receiver, filter)
+        loadBundled()
         scan()
     }
 
@@ -80,88 +74,108 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    private fun scan() {
-        val found = usb.deviceList.values.firstOrNull {
-            it.vendorId == AppleUsb.VENDOR &&
-                (it.productId == AppleUsb.PID_DFU || it.productId == AppleUsb.PID_RECOVERY)
+    private fun loadBundled() {
+        for (name in listOf("payloads/ibss.img3", "payloads/ramdisk.dmg")) {
+            try {
+                val bytes = assets.open(name).use { it.readBytes() }
+                images.add(bytes)
+                log("bundled $name ${bytes.size}")
+            } catch (_: Exception) {
+            }
         }
+    }
+
+    private fun scan() {
+        val found = appleDevice()
         if (found == null) {
             status.text = "no device"
             log("waiting for 05ac:1227 or 05ac:1281")
             return
         }
         device = found
-        status.text = AppleUsb.mode(found)
         if (!usb.hasPermission(found)) {
             val pending = PendingIntent.getBroadcast(this, 0, Intent(actionUsb), PendingIntent.FLAG_IMMUTABLE)
             usb.requestPermission(found, pending)
-        } else {
-            log("already permitted ${AppleUsb.mode(found)}")
-        }
+        } else show(found)
+    }
+
+    private fun show(dev: UsbDevice) {
+        val id = AppleUsb.identity(dev)
+        val who = if (id == null) "serial hidden" else "CPID:%04X BDID:%02X".format(id.cpid, id.bdid)
+        status.text = AppleUsb.mode(dev) + "  " + who
+        log(id?.raw ?: AppleUsb.mode(dev))
+    }
+
+    private fun appleDevice(): UsbDevice? = usb.deviceList.values.firstOrNull {
+        it.vendorId == AppleUsb.VENDOR && (it.productId == AppleUsb.PID_DFU || it.productId == AppleUsb.PID_RECOVERY)
     }
 
     private fun startJailbreak() {
-        val dev = device
-        val image = payload
-        if (dev == null) {
-            scan()
-            log("no apple device on the bus")
+        val dev = device ?: appleDevice()
+        if (dev == null) { scan(); log("no apple device on the bus"); return }
+        if (images.isEmpty()) { log("no images. pick ibss then ramdisk, in that order"); return }
+        device = dev
+        if (!usb.hasPermission(dev)) { scan(); return }
+        val id = AppleUsb.identity(dev)
+        if (id != null && !AppleUsb.isAtv2(id)) {
+            log("not AppleTV2,1. got CPID:%04X BDID:%02X".format(id.cpid, id.bdid))
             return
         }
-        if (image == null) {
-            log("pick the baked image first")
-            return
-        }
-        if (!usb.hasPermission(dev)) {
-            scan()
-            return
-        }
-        io.execute {
-            val conn = usb.openDevice(dev)
-            if (conn == null) {
-                log("openDevice failed")
-                return@execute
-            }
+        io.execute { runChain() }
+    }
+
+    private fun runChain() {
+        for ((index, image) in images.withIndex()) {
+            val dev = waitFor("dfu", 20000) ?: run { log("image $index: DFU did not come back"); return }
+            if (!usb.hasPermission(dev)) { log("image $index: no permission after re-enum"); return }
+            val conn = usb.openDevice(dev) ?: run { log("openDevice failed"); return }
             try {
                 AppleUsb.claim(conn, dev)
-                val mode = AppleUsb.mode(dev)
-                log("opened $mode")
-                if (mode != "dfu") {
-                    log("not in DFU. Menu+Down until the LED strobes.")
-                    return@execute
-                }
-                val ok = AppleUsb.dfuSend(conn, image) { log(it) }
-                log(if (ok) "upload finished" else "upload failed")
-            } finally {
-                conn.close()
-            }
+                log("sending image $index (${image.size})")
+                if (!AppleUsb.dfuSend(conn, image) { log(it) }) return
+            } finally { conn.close() }
+            if (index != images.lastIndex) { log("waiting for re-enumeration"); Thread.sleep(1500) }
         }
+        val rec = waitFor("recovery", 30000)
+        if (rec != null) { device = rec; log("recovery is up"); sendRecovery("bootx") }
+        else log("chain sent. recovery did not enumerate.")
+    }
+
+    private fun waitFor(mode: String, timeoutMs: Long): UsbDevice? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val dev = appleDevice()
+            if (dev != null && AppleUsb.mode(dev) == mode) {
+                device = dev
+                if (!usb.hasPermission(dev)) {
+                    runOnUiThread {
+                        val pending = PendingIntent.getBroadcast(this, 0, Intent(actionUsb), PendingIntent.FLAG_IMMUTABLE)
+                        usb.requestPermission(dev, pending)
+                    }
+                }
+                if (usb.hasPermission(dev)) return dev
+            }
+            Thread.sleep(400)
+        }
+        return null
     }
 
     private fun sendRecovery(command: String) {
-        val dev = device ?: run { log("no device"); return }
-        if (AppleUsb.mode(dev) != "recovery") {
-            log("boot command needs recovery, current ${AppleUsb.mode(dev)}")
-            return
-        }
+        val dev = appleDevice() ?: device ?: run { log("no device"); return }
+        if (AppleUsb.mode(dev) != "recovery") { log("boot needs recovery, current ${AppleUsb.mode(dev)}"); return }
+        if (!usb.hasPermission(dev)) { log("no permission"); return }
         val conn = usb.openDevice(dev) ?: run { log("openDevice failed"); return }
         try {
             AppleUsb.claim(conn, dev)
             log("$command -> " + AppleUsb.recoveryCommand(conn, command))
-        } finally {
-            conn.close()
-        }
+        } finally { conn.close() }
     }
 
     private fun readUri(uri: Uri): ByteArray {
-        contentResolver.openInputStream(uri).use { input ->
-            return input?.readBytes() ?: ByteArray(0)
-        }
+        contentResolver.openInputStream(uri).use { input -> return input?.readBytes() ?: ByteArray(0) }
     }
 
-    private fun log(line: String) {
-        runOnUiThread { logView.append(line + "\n") }
-    }
+    private fun log(line: String) { runOnUiThread { logView.append(line + "\n") } }
 }
 
 private inline fun <reified T> Intent.parcelable(key: String): T? {
