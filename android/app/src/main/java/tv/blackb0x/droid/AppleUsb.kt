@@ -1,7 +1,10 @@
 package tv.blackb0x.droid
 
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
+import android.hardware.usb.UsbInterface
 
 object AppleUsb {
     const val VENDOR = 0x05AC
@@ -38,7 +41,6 @@ object AppleUsb {
         return id.cpid == CPID_A4 && id.bdid == BDID_ATV2
     }
 
-    /** claim only — setConfiguration resets DFU and kills the next OUT transfer */
     fun claim(connection: UsbDeviceConnection, device: UsbDevice, configure: Boolean = false): Boolean {
         if (device.interfaceCount < 1) return false
         val claimed = connection.claimInterface(device.getInterface(0), true)
@@ -90,6 +92,50 @@ object AppleUsb {
             log("dfu err=$err state=$state ($tag)")
             return false
         }
+        return true
+    }
+
+    /** recovery bulk OUT — libirecovery endpoint 0x04 */
+    fun recoverySend(
+        connection: UsbDeviceConnection,
+        device: UsbDevice,
+        data: ByteArray,
+        log: (String) -> Unit,
+    ): Boolean {
+        if (data.isEmpty()) return false
+        val iface: UsbInterface = device.getInterface(0)
+        var bulkOut: UsbEndpoint? = null
+        for (i in 0 until iface.endpointCount) {
+            val ep = iface.getEndpoint(i)
+            if (ep.direction == UsbConstants.USB_DIR_OUT &&
+                ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK
+            ) {
+                bulkOut = ep
+                break
+            }
+        }
+        if (bulkOut == null) {
+            log("no bulk OUT — trying DFU control path")
+            return dfuSend(connection, data, log)
+        }
+        val packet = minOf(0x8000, bulkOut.maxPacketSize * 32).coerceAtLeast(bulkOut.maxPacketSize)
+        var sent = 0
+        var part = 0
+        while (sent < data.size) {
+            val n = minOf(packet, data.size - sent)
+            val chunk = ByteArray(n)
+            System.arraycopy(data, sent, chunk, 0, n)
+            val r = connection.bulkTransfer(bulkOut, chunk, n, 8000)
+            if (r != n) {
+                log("bulk send part $part r=$r wanted $n")
+                return false
+            }
+            sent += n
+            part++
+            if (part % 16 == 0) log("recovery $sent / ${data.size}")
+        }
+        connection.bulkTransfer(bulkOut, ByteArray(0), 0, 1000)
+        log("recovery ${data.size} bytes sent")
         return true
     }
 
