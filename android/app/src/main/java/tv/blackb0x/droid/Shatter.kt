@@ -73,8 +73,14 @@ object Shatter {
         }
 
         fun busReset(c: UsbDeviceConnection) {
-            val ok = try { c.resetDevice() } catch (_: Throwable) { false }
-            log(if (ok) "usb reset" else "usb reset not supported")
+            // resetDevice exists at runtime (API 24+) but some compile stubs omit it — reflect
+            val ok = try {
+                val m = UsbDeviceConnection::class.java.getMethod("resetDevice")
+                (m.invoke(c) as? Boolean) == true
+            } catch (_: Throwable) {
+                false
+            }
+            log(if (ok) "usb reset" else "usb reset skipped")
             try { c.close() } catch (_: Exception) {}
             val until = System.currentTimeMillis() + 2500
             while (System.currentTimeMillis() < until && dfuPresent()) Thread.sleep(40)
