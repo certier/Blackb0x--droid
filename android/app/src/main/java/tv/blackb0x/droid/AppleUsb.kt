@@ -1,5 +1,3 @@
-// lang: Kotlin, file: AppleUsb.kt, target: Android 7+, USB host
-// VID 0x05AC. DFU PID 0x1227. Recovery PID 0x1281.
 package tv.blackb0x.droid
 
 import android.hardware.usb.UsbDevice
@@ -10,12 +8,34 @@ object AppleUsb {
     const val PID_DFU = 0x1227
     const val PID_RECOVERY = 0x1281
     const val PACKET = 0x800
+    const val CPID_A4 = 0x8930
+    const val BDID_ATV2 = 0x10
+
+    data class Identity(val cpid: Int, val bdid: Int, val ecid: String, val raw: String)
 
     fun mode(device: UsbDevice): String = when {
         device.vendorId != VENDOR -> "other"
         device.productId == PID_DFU -> "dfu"
         device.productId == PID_RECOVERY -> "recovery"
         else -> "apple-other:%04x".format(device.productId)
+    }
+
+    fun identity(device: UsbDevice): Identity? {
+        val raw = device.serialNumber ?: return null
+        fun field(name: String): String? {
+            val i = raw.indexOf(name)
+            if (i < 0) return null
+            return raw.substring(i + name.length).takeWhile { it != ' ' && it != '\u0000' }
+        }
+        val cpid = field("CPID:")?.toIntOrNull(16) ?: return null
+        val bdid = field("BDID:")?.toIntOrNull(16) ?: -1
+        val ecid = field("ECID:") ?: ""
+        return Identity(cpid, bdid, ecid, raw)
+    }
+
+    fun isAtv2(id: Identity?): Boolean {
+        if (id == null) return true
+        return id.cpid == CPID_A4 && id.bdid == BDID_ATV2
     }
 
     fun claim(connection: UsbDeviceConnection, device: UsbDevice): Boolean {
@@ -40,7 +60,7 @@ object AppleUsb {
                 return false
             }
             if (!dfuStatus(connection, log, "block $i")) return false
-            if (i % 64 == 0) log("dfu $off / ${image.size}")
+            if (i % 32 == 0) log("dfu $off / ${image.size}")
         }
         val end = connection.controlTransfer(0x21, 1, packets, 0, ByteArray(0), 0, 1000)
         if (end < 0) {
@@ -49,7 +69,7 @@ object AppleUsb {
         }
         dfuStatus(connection, log, "finish")
         dfuStatus(connection, log, "finish-2")
-        log("dfu image ${image.size} bytes sent")
+        log("image ${image.size} bytes sent")
         return true
     }
 
@@ -63,7 +83,7 @@ object AppleUsb {
         val err = status[0].toInt() and 0xFF
         val state = status[4].toInt() and 0xFF
         if (err != 0) {
-            log("dfu status err=$err state=$state ($tag)")
+            log("dfu err=$err state=$state ($tag)")
             return false
         }
         return true
