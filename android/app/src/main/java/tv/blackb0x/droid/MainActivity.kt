@@ -50,7 +50,12 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                    log("usb attached")
+                    val d = intent.parcelable<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    if (d != null && d.vendorId == AppleUsb.VENDOR) {
+                        log("usb attached pid=%04x mode=%s".format(d.productId, AppleUsb.mode(d)))
+                    } else {
+                        log("usb attached")
+                    }
                     scan()
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -59,6 +64,8 @@ class MainActivity : AppCompatActivity() {
                         setStatus("waiting for device", GRAY)
                         jailbreakBtn.isEnabled = false
                         log("usb detached")
+                    } else {
+                        log("usb detached (expected mid-chain)")
                     }
                 }
             }
@@ -159,12 +166,12 @@ class MainActivity : AppCompatActivity() {
         }
         setStatus(line, if (ready) GREEN else YELLOW)
         jailbreakBtn.isEnabled = ready && !running.get()
-        if (id != null) log("CPID:%04X BDID:%02X".format(id.cpid, id.bdid))
+        if (id != null) log("CPID:%04X BDID:%02X pid=%04x".format(id.cpid, id.bdid, dev.productId))
     }
 
     private fun appleDevice(): UsbDevice? = usb.deviceList.values.firstOrNull {
         it.vendorId == AppleUsb.VENDOR &&
-            (it.productId == AppleUsb.PID_DFU || it.productId == AppleUsb.PID_RECOVERY)
+            (it.productId == AppleUsb.PID_DFU || AppleUsb.isRecoveryPid(it.productId))
     }
 
     private fun startJailbreak() {
@@ -209,6 +216,26 @@ class MainActivity : AppCompatActivity() {
         return d to c
     }
 
+    /** Wait for device to leave, then return first apple reattach (any mode). */
+    private fun waitReconnect(timeoutMs: Long): UsbDevice? {
+        val untilGone = System.currentTimeMillis() + 8000
+        while (System.currentTimeMillis() < untilGone) {
+            if (appleDevice() == null) break
+            Thread.sleep(200)
+        }
+        log("waiting for reconnect…")
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val d = appleDevice()
+            if (d != null) {
+                log("reappeared pid=%04x mode=%s".format(d.productId, AppleUsb.mode(d)))
+                if (ensurePermission(d)) return d
+            }
+            Thread.sleep(300)
+        }
+        return null
+    }
+
     private fun runChain(
         ibssImage: ByteArray,
         ibecImage: ByteArray,
@@ -250,29 +277,62 @@ class MainActivity : AppCompatActivity() {
             try { dfuPair.second.close() } catch (_: Exception) {}
         }
 
-        Thread.sleep(2500)
+        // iBSS should cause disconnect + recovery (or pwned DFU)
+        val after = waitReconnect(45_000)
+        if (after == null) {
+            setStatus("no device after iBSS", RED)
+            log("iBSS sent but device never came back")
+            return
+        }
 
         log("3/5 send iBEC (${ibecImage.size})")
         var sentIbec = false
-        val rec1 = openMode("recovery", 35_000)
-        if (rec1 != null) {
-            try {
-                sentIbec = AppleUsb.recoverySend(rec1.second, rec1.first, ibecImage) { log(it) }
-            } finally {
-                try { rec1.second.close() } catch (_: Exception) {}
-            }
-        }
-        if (!sentIbec) {
-            log("recovery miss — try DFU for iBEC")
-            val dfu2 = openMode("dfu", 15_000)
-            if (dfu2 != null) {
-                try {
-                    sentIbec = AppleUsb.dfuSend(dfu2.second, ibecImage) { log(it) }
-                } finally {
-                    try { dfu2.second.close() } catch (_: Exception) {}
+
+        // prefer recovery
+        if (AppleUsb.mode(after) == "recovery") {
+            if (ensurePermission(after)) {
+                val c = usb.openDevice(after)
+                if (c != null) {
+                    try {
+                        if (AppleUsb.claim(c, after, configure = false)) {
+                            sentIbec = AppleUsb.recoverySend(c, after, ibecImage) { log(it) }
+                        }
+                    } finally {
+                        try { c.close() } catch (_: Exception) {}
+                    }
                 }
             }
         }
+
+        if (!sentIbec) {
+            val rec = openMode("recovery", 20_000)
+            if (rec != null) {
+                try {
+                    sentIbec = AppleUsb.recoverySend(rec.second, rec.first, ibecImage) { log(it) }
+                } finally {
+                    try { rec.second.close() } catch (_: Exception) {}
+                }
+            }
+        }
+
+        if (!sentIbec) {
+            log("no recovery — iBEC over DFU with clear")
+            for (attempt in 1..3) {
+                val dfu = openMode("dfu", 12_000) ?: continue
+                try {
+                    AppleUsb.dfuClear(dfu.second)
+                    if (AppleUsb.dfuSend(dfu.second, ibecImage) { log(it) }) {
+                        sentIbec = true
+                        break
+                    }
+                    log("iBEC DFU attempt $attempt failed")
+                } finally {
+                    try { dfu.second.close() } catch (_: Exception) {}
+                }
+                Thread.sleep(1000)
+            }
+        }
+
         if (!sentIbec) {
             setStatus("iBEC send failed", RED)
             log("TV may stay black — iBEC did not land")
@@ -280,6 +340,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         Thread.sleep(3000)
+        waitReconnect(20_000)
 
         if (ramdiskImage != null && ramdiskImage.isNotEmpty()) {
             log("4/5 send ramdisk (${ramdiskImage.size})")
