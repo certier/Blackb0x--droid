@@ -125,8 +125,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runChain() {
+        log("running SHAtter")
+        val pwned = Shatter.run(
+            usb,
+            open = {
+                val d = waitFor("dfu", 15000) ?: return@run null
+                if (!usb.hasPermission(d)) return@run null
+                val conn = usb.openDevice(d) ?: return@run null
+                d to conn
+            },
+            log = { log(it) },
+            progress = { p -> log("shatter ${p.toInt()}%") },
+        )
+        if (!pwned) {
+            log("SHAtter failed — aborting image chain")
+            return
+        }
+        Thread.sleep(1000)
         for ((index, image) in images.withIndex()) {
-            val dev = waitFor("dfu", 20000) ?: run { log("image $index: DFU did not come back"); return }
+            val dev = waitFor("dfu", 30000) ?: run { log("image $index: DFU did not come back"); return }
             if (!usb.hasPermission(dev)) { log("image $index: no permission after re-enum"); return }
             val conn = usb.openDevice(dev) ?: run { log("openDevice failed"); return }
             try {
