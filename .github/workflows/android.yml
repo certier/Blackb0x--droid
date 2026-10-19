@@ -5,6 +5,8 @@ on:
     branches: [android-usb-host]
     paths:
       - "android/**"
+      - "scripts/android_embed_ibss.py"
+      - "keys/AppleTV2,1/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -15,9 +17,6 @@ env:
 jobs:
   apk:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: android
     steps:
       - uses: actions/checkout@v4
 
@@ -26,11 +25,18 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Embed decrypted iBSS into assets
+        run: |
+          set -e
+          python3 -m pip install --user pycryptodome
+          python3 scripts/android_embed_ibss.py
+          ls -la android/app/src/main/assets/payloads/
+
       - name: Locate and prepare SDK
+        working-directory: android
         run: |
           set -e
           if [ ! -d "$ANDROID_HOME" ]; then
-            echo "runner SDK missing, installing cmdline-tools"
             mkdir -p $HOME/android-sdk/cmdline-tools
             curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
             unzip -q /tmp/cmdtools.zip -d $HOME/android-sdk/cmdline-tools
@@ -51,6 +57,7 @@ jobs:
           gradle-version: 8.9
 
       - name: Assemble debug APK
+        working-directory: android
         run: gradle :app:assembleDebug --no-daemon
 
       - uses: actions/upload-artifact@v4
