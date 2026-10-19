@@ -9,17 +9,21 @@ import android.hardware.usb.UsbInterface
 object AppleUsb {
     const val VENDOR = 0x05AC
     const val PID_DFU = 0x1227
-    const val PID_RECOVERY = 0x1281
+    // libirecovery: 0x1280..0x1283 all recovery
+    const val PID_RECOVERY_LO = 0x1280
+    const val PID_RECOVERY_HI = 0x1283
     const val PACKET = 0x800
     const val CPID_A4 = 0x8930
     const val BDID_ATV2 = 0x10
 
     data class Identity(val cpid: Int, val bdid: Int, val ecid: String, val raw: String)
 
+    fun isRecoveryPid(pid: Int): Boolean = pid in PID_RECOVERY_LO..PID_RECOVERY_HI
+
     fun mode(device: UsbDevice): String = when {
         device.vendorId != VENDOR -> "other"
         device.productId == PID_DFU -> "dfu"
-        device.productId == PID_RECOVERY -> "recovery"
+        isRecoveryPid(device.productId) -> "recovery"
         else -> "apple-other:%04x".format(device.productId)
     }
 
@@ -50,22 +54,48 @@ object AppleUsb {
         return claimed
     }
 
+    /** Clear DFU error state → dfuIDLE. Required after errWRITE (8). */
+    fun dfuClear(connection: UsbDeviceConnection) {
+        connection.controlTransfer(0x21, 4, 0, 0, ByteArray(0), 0, 1000) // CLRSTATUS
+        val status = ByteArray(6)
+        repeat(3) {
+            connection.controlTransfer(0xA1, 3, 0, 0, status, 6, 1000)
+            val state = status[4].toInt() and 0xFF
+            if (state == 2 || state == 5) return // dfuIDLE / dfuDNLOAD-IDLE
+            connection.controlTransfer(0x21, 4, 0, 0, ByteArray(0), 0, 500)
+        }
+    }
+
     fun dfuSend(connection: UsbDeviceConnection, image: ByteArray, log: (String) -> Unit): Boolean {
         if (image.isEmpty()) {
             log("empty image")
             return false
         }
+        dfuClear(connection)
         val packets = (image.size + PACKET - 1) / PACKET
         for (i in 0 until packets) {
             val off = i * PACKET
             val n = minOf(PACKET, image.size - off)
             val chunk = image.copyOfRange(off, off + n)
-            val sent = connection.controlTransfer(0x21, 1, i, 0, chunk, n, 5000)
+            var sent = connection.controlTransfer(0x21, 1, i, 0, chunk, n, 5000)
             if (sent != n) {
-                log("dnload block $i sent $sent wanted $n")
-                return false
+                // one recovery from stalled DFU
+                log("dnload block $i sent $sent — clear and retry")
+                dfuClear(connection)
+                sent = connection.controlTransfer(0x21, 1, i, 0, chunk, n, 5000)
+                if (sent != n) {
+                    log("dnload block $i sent $sent wanted $n")
+                    return false
+                }
             }
-            if (!dfuStatus(connection, log, "block $i")) return false
+            if (!dfuStatus(connection, log, "block $i")) {
+                log("status fail at $i — clear and retry packet")
+                dfuClear(connection)
+                sent = connection.controlTransfer(0x21, 1, i, 0, chunk, n, 5000)
+                if (sent != n || !dfuStatus(connection, log, "block $i retry")) {
+                    return false
+                }
+            }
             if (i % 32 == 0) log("dfu $off / ${image.size}")
         }
         val end = connection.controlTransfer(0x21, 1, packets, 0, ByteArray(0), 0, 1000)
@@ -73,8 +103,8 @@ object AppleUsb {
             log("finish dnload failed $end")
             return false
         }
+        // after final ZLP, device often disconnects — status may fail, treat as ok
         dfuStatus(connection, log, "finish")
-        dfuStatus(connection, log, "finish-2")
         log("image ${image.size} bytes sent")
         return true
     }
@@ -83,6 +113,8 @@ object AppleUsb {
         val status = ByteArray(6)
         val n = connection.controlTransfer(0xA1, 3, 0, 0, status, 6, 1000)
         if (n != 6) {
+            // disconnect mid-finish is normal after iBSS
+            if (tag.startsWith("finish")) return true
             log("getstatus $tag returned $n")
             return false
         }
@@ -95,7 +127,6 @@ object AppleUsb {
         return true
     }
 
-    /** recovery bulk OUT — libirecovery endpoint 0x04 */
     fun recoverySend(
         connection: UsbDeviceConnection,
         device: UsbDevice,
@@ -115,7 +146,7 @@ object AppleUsb {
             }
         }
         if (bulkOut == null) {
-            log("no bulk OUT — trying DFU control path")
+            log("no bulk OUT — DFU control path")
             return dfuSend(connection, data, log)
         }
         val packet = minOf(0x8000, bulkOut.maxPacketSize * 32).coerceAtLeast(bulkOut.maxPacketSize)
