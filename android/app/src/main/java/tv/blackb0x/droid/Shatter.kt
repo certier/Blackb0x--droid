@@ -5,8 +5,9 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 
 /**
- * SHAtter for AppleTV2,1 (A4 / CPID 0x8930). Port of DeviceManager::SHAtter
- * and the libirecovery USB helpers it calls. Payload is SHAtter.h verbatim.
+ * SHAtter for AppleTV2,1 (A4 / CPID 0x8930). Port of DeviceManager::SHAtter.
+ * Large getData stages used to hang on Android if USB stalled — transfers
+ * are now checked and timed so 25% cannot freeze the UI forever.
  */
 object Shatter {
     private val PAYLOAD = byteArrayOf(
@@ -67,7 +68,11 @@ object Shatter {
         progress(5.0)
         var c = reopen() ?: return fail(log, "open failed")
         resetCounters(c)
-        getData(c, 0x40)
+        // small read — errors here are fatal
+        if (!getData(c, 0x40, log, allowStall = false)) {
+            c.close()
+            return fail(log, "getData 0x40")
+        }
         progress(15.0)
         c.close()
 
@@ -76,42 +81,46 @@ object Shatter {
         requestImageValidation(c)
         c.close()
 
-        log("Filling buffer with zeros")
+        // 0x2C000 is ~176 packets — this is the stage that looked "stuck at 25%"
+        log("Filling buffer (this can take ~30–90s on OTG)")
         progress(25.0)
         c = reopen() ?: return fail(log, "open fill")
-        getData(c, 0x2C000)
-        progress(30.0)
-        c.close()
+        // stalls/errors during the big fill are common mid-SHAtter; keep going
+        getData(c, 0x2C000, log, allowStall = true) { done, total ->
+            val pct = 25.0 + (done.toDouble() / total) * 10.0
+            progress(pct)
+        }
+        progress(35.0)
+        try { c.close() } catch (_: Exception) {}
 
-        Thread.sleep(500)
+        Thread.sleep(800)
 
         log("Overwriting SHA1 registers")
-        progress(35.0)
-        c = reopen() ?: return fail(log, "open sha1")
-        resetCounters(c)
         progress(40.0)
-        getData(c, 0x140)
-        c.close()
+        c = reopen() ?: return fail(log, "open sha1 — re-enter DFU and retry")
+        resetCounters(c)
+        getData(c, 0x140, log, allowStall = true)
+        try { c.close() } catch (_: Exception) {}
 
         c = reopen() ?: return fail(log, "open validate2")
         progress(55.0)
         requestImageValidation(c)
-        c.close()
+        try { c.close() } catch (_: Exception) {}
 
         log("Sending SHAtter payload")
         c = reopen() ?: return fail(log, "open payload")
         progress(65.0)
         if (!sendBuffer(c, PAYLOAD, log)) {
-            c.close()
+            try { c.close() } catch (_: Exception) {}
             return false
         }
         progress(85.0)
         log("Overwriting exception vectors")
-        getData(c, 0x2C000)
-        progress(90.0)
-        c.close()
+        getData(c, 0x2C000, log, allowStall = true)
+        progress(95.0)
+        try { c.close() } catch (_: Exception) {}
 
-        Thread.sleep(500)
+        Thread.sleep(800)
         progress(100.0)
         log("SHAtter successful")
         return true
@@ -123,26 +132,57 @@ object Shatter {
     }
 
     private fun resetCounters(c: UsbDeviceConnection) {
-        c.controlTransfer(0x21, 4, 0, 0, null, 0, 1000)
+        c.controlTransfer(0x21, 4, 0, 0, null, 0, 500)
     }
 
-    private fun getData(c: UsbDeviceConnection, length: Int) {
+    /**
+     * @param allowStall when true, a failed/short transfer ends the loop early
+     *   instead of spinning on 5s timeouts (the old hang-at-25% bug).
+     */
+    private fun getData(
+        c: UsbDeviceConnection,
+        length: Int,
+        log: (String) -> Unit,
+        allowStall: Boolean,
+        onProgress: ((Int, Int) -> Unit)? = null,
+    ): Boolean {
         val packet = 0x800
         val buf = ByteArray(packet)
         var left = length
+        var done = 0
+        var packets = 0
         while (left > 0) {
             val n = minOf(packet, left)
-            c.controlTransfer(0xA1, 2, 0, 0, buf, n, 5000)
+            // 800ms — never sit on a dead pipe for 5s × 176 packets
+            val r = c.controlTransfer(0xA1, 2, 0, 0, buf, n, 800)
+            if (r < 0) {
+                if (allowStall) {
+                    log("getData stall after $done/$length (ok for this stage)")
+                    return true
+                }
+                log("getData failed r=$r at $done/$length")
+                return false
+            }
+            if (r == 0 && allowStall) {
+                log("getData empty after $done/$length")
+                return true
+            }
             left -= n
+            done += n
+            packets++
+            if (packets % 16 == 0) {
+                onProgress?.invoke(done, length)
+            }
         }
+        return true
     }
 
     private fun requestImageValidation(c: UsbDeviceConnection) {
-        c.controlTransfer(0x21, 1, 0, 0, null, 0, 1000)
+        c.controlTransfer(0x21, 1, 0, 0, null, 0, 500)
         val blank = ByteArray(16)
-        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 1000)
-        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 1000)
-        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 1000)
+        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 500)
+        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 500)
+        c.controlTransfer(0xA1, 3, 0, 0, blank, 6, 500)
     }
 
     private fun sendBuffer(c: UsbDeviceConnection, data: ByteArray, log: (String) -> Unit): Boolean {
@@ -152,20 +192,20 @@ object Shatter {
         while (sent < data.size) {
             val n = minOf(packet, data.size - sent)
             val chunk = data.copyOfRange(sent, sent + n)
-            val r = c.controlTransfer(0x21, 1, block, 0, chunk, n, 5000)
+            val r = c.controlTransfer(0x21, 1, block, 0, chunk, n, 2000)
             if (r != n) {
                 log("payload send block $block r=$r")
                 return false
             }
             val status = ByteArray(6)
-            c.controlTransfer(0xA1, 3, 0, 0, status, 6, 1000)
+            c.controlTransfer(0xA1, 3, 0, 0, status, 6, 500)
             sent += n
             block++
         }
-        c.controlTransfer(0x21, 1, block, 0, ByteArray(0), 0, 1000)
+        c.controlTransfer(0x21, 1, block, 0, ByteArray(0), 0, 500)
         val status = ByteArray(6)
-        c.controlTransfer(0xA1, 3, 0, 0, status, 6, 1000)
-        c.controlTransfer(0xA1, 3, 0, 0, status, 6, 1000)
+        c.controlTransfer(0xA1, 3, 0, 0, status, 6, 500)
+        c.controlTransfer(0xA1, 3, 0, 0, status, 6, 500)
         return true
     }
 }
