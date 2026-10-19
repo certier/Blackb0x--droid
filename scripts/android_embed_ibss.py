@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch + decrypt AppleTV2,1 iBSS (11D258 / tvOS 7.1.2) into android assets."""
+"""Fetch + decrypt AppleTV2,1 11D258 boot components into android APK assets."""
 import json, os, struct, sys, urllib.request, zipfile, plistlib
 
 try:
@@ -12,7 +12,15 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEVICE = "AppleTV2,1"
 BUILD = "11D258"
-OUT = os.path.join(ROOT, "android", "app", "src", "main", "assets", "payloads", "ibss.img3")
+OUT_DIR = os.path.join(ROOT, "android", "app", "src", "main", "assets", "payloads")
+
+# (BuildManifest key, keys-file key, output filename)
+COMPONENTS = [
+    ("iBSS", "iBSS", "ibss.img3"),
+    ("iBEC", "iBEC", "ibec.img3"),
+    ("KernelCache", "Kernelcache", "kernelcache.img3"),
+    ("RestoreRamDisk", "RestoreRamdisk", "ramdisk.dmg"),
+]
 
 
 class HTTPRangeFile:
@@ -43,7 +51,7 @@ class HTTPRangeFile:
         if end < self.pos:
             return b""
         req = urllib.request.Request(self.url, headers={"Range": f"bytes={self.pos}-{end}"})
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             data = r.read()
         self.pos += len(data)
         return data
@@ -67,27 +75,8 @@ def find_path(node, target):
     return None
 
 
-def main():
-    keys_path = os.path.join(ROOT, "keys", DEVICE, f"{DEVICE}_{BUILD}.keys")
-    with open(keys_path, "rb") as f:
-        keys = plistlib.load(f)
-    iv = bytes.fromhex(keys["iBSS"][0])
-    key = bytes.fromhex(keys["iBSS"][1])
-
-    with urllib.request.urlopen(f"https://api.ipsw.me/v4/device/{DEVICE}?type=ipsw", timeout=30) as r:
-        data = json.load(r)
-    url = next(fw["url"] for fw in data["firmwares"] if fw["buildid"] == BUILD)
-    print("url", url)
-
-    zf = zipfile.ZipFile(HTTPRangeFile(url))
-    manifest = plistlib.loads(zf.read("BuildManifest.plist"))
-    path = find_path(manifest, "iBSS")
-    print("component", path)
-    enc = zf.read(path)
-    print("encrypted", len(enc))
-
+def decrypt_img3(enc, iv, key):
     off = 20
-    out = None
     while off + 12 <= len(enc):
         tag_total = struct.unpack_from("<I", enc, off + 4)[0]
         tag_name = enc[off:off + 4]
@@ -96,16 +85,46 @@ def main():
             payload = enc[off + 12:off + 12 + tag_data]
             pad = (16 - (len(payload) % 16)) % 16
             dec = AES.new(key, AES.MODE_CBC, iv).decrypt(payload + b"\x00" * pad)[:len(payload)]
-            out = enc[:off + 12] + dec + enc[off + 12 + tag_data:]
-            break
+            return enc[:off + 12] + dec + enc[off + 12 + tag_data:]
         if tag_total < 12:
             break
         off += tag_total
-    if not out:
-        raise SystemExit("no DATA tag")
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    open(OUT, "wb").write(out)
-    print("wrote", OUT, len(out))
+    raise SystemExit("no DATA tag in component")
+
+
+def main():
+    keys_path = os.path.join(ROOT, "keys", DEVICE, f"{DEVICE}_{BUILD}.keys")
+    with open(keys_path, "rb") as f:
+        keys = plistlib.load(f)
+
+    with urllib.request.urlopen(f"https://api.ipsw.me/v4/device/{DEVICE}?type=ipsw", timeout=30) as r:
+        data = json.load(r)
+    url = next(fw["url"] for fw in data["firmwares"] if fw["buildid"] == BUILD)
+    print("url", url)
+
+    zf = zipfile.ZipFile(HTTPRangeFile(url))
+    manifest = plistlib.loads(zf.read("BuildManifest.plist"))
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    for manifest_key, keys_key, out_name in COMPONENTS:
+        path = find_path(manifest, manifest_key)
+        if not path:
+            raise SystemExit(f"missing {manifest_key} in BuildManifest")
+        print(manifest_key, path)
+        enc = zf.read(path)
+        print("  encrypted", len(enc))
+        if keys_key not in keys:
+            # try case variants
+            match = next((k for k in keys if k.lower() == keys_key.lower()), None)
+            if not match:
+                raise SystemExit(f"no key for {keys_key}")
+            keys_key = match
+        iv = bytes.fromhex(keys[keys_key][0])
+        key = bytes.fromhex(keys[keys_key][1])
+        out = decrypt_img3(enc, iv, key)
+        out_path = os.path.join(OUT_DIR, out_name)
+        open(out_path, "wb").write(out)
+        print("  wrote", out_path, len(out))
 
 
 if __name__ == "__main__":
