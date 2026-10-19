@@ -75,7 +75,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadBundled() {
-        for (name in listOf("payloads/ibss.img3", "payloads/ramdisk.dmg")) {
+        // order matters: iBSS first after SHAtter, then iBEC, kernel, ramdisk
+        for (name in listOf(
+            "payloads/ibss.img3",
+            "payloads/ibec.img3",
+            "payloads/kernelcache.img3",
+            "payloads/ramdisk.dmg",
+        )) {
             try {
                 val bytes = assets.open(name).use { it.readBytes() }
                 images.add(bytes)
@@ -83,6 +89,7 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {
             }
         }
+        if (images.isNotEmpty()) log("ready — ${images.size} image(s) loaded, press Jailbreak")
     }
 
     private fun scan() {
@@ -113,7 +120,7 @@ class MainActivity : AppCompatActivity() {
     private fun startJailbreak() {
         val dev = device ?: appleDevice()
         if (dev == null) { scan(); log("no apple device on the bus"); return }
-        if (images.isEmpty()) { log("no images. pick ibss then ramdisk, in that order"); return }
+        if (images.isEmpty()) { log("no bundled images — wait for APK built with embed step"); return }
         device = dev
         if (!usb.hasPermission(dev)) { scan(); return }
         val id = AppleUsb.identity(dev)
